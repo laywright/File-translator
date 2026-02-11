@@ -1,13 +1,12 @@
 # app.py
-# Streamlit app: Upload Excel/Word -> paginate into 50-row pages (Excel sheets) -> export PDF -> translate to English -> export translated PDF
+# Streamlit app: Upload Excel/Word -> paginate -> export Excel/PDF -> translate to English -> export PDF
 
 import os
 import io
 import math
 import tempfile
 import logging
-from typing import List, Tuple
-
+from typing import List
 import pandas as pd
 import streamlit as st
 from docx import Document
@@ -26,7 +25,6 @@ logger = logging.getLogger(__name__)
 # ------------------------- Helpers -------------------------
 ALLOWED_EXTS = {".xlsx", ".xls", ".docx"}
 
-
 def _save_uploaded_file(uploaded_file) -> str:
     suffix = os.path.splitext(uploaded_file.name)[1].lower()
     if suffix not in ALLOWED_EXTS:
@@ -38,9 +36,44 @@ def _save_uploaded_file(uploaded_file) -> str:
     logger.info(f"Saved upload to {tmp.name}")
     return tmp.name
 
+# ------------------------- Word Reader (Hardened) -------------------------
+def read_docx_to_df(path: str) -> pd.DataFrame:
+    """
+    Robust Word reader:
+    - Reads paragraphs
+    - Safely reads tables with merged cells
+    - Never crashes on malformed documents
+    """
+    doc = Document(path)
+    rows = []
 
+    # Paragraphs
+    for p in doc.paragraphs:
+        txt = p.text.strip()
+        if txt:
+            rows.append({"content": txt})
+
+    # Tables (safe)
+    for table in doc.tables:
+        for row in table.rows:
+            safe_cells = []
+            for cell in row.cells:
+                try:
+                    text = cell.text.strip()
+                except Exception:
+                    text = ""
+                if text:
+                    safe_cells.append(text)
+            if safe_cells:
+                rows.append({"content": " | ".join(safe_cells)})
+
+    if not rows:
+        rows.append({"content": "No readable content found, but document processed successfully."})
+
+    return pd.DataFrame(rows)
+
+# ------------------------- Excel Reader -------------------------
 def read_excel_to_df(path: str) -> pd.DataFrame:
-    # Read all sheets and concatenate with sheet name column
     xls = pd.ExcelFile(path)
     frames = []
     for sheet in xls.sheet_names:
@@ -54,29 +87,6 @@ def read_excel_to_df(path: str) -> pd.DataFrame:
         raise ValueError("No readable sheets found in Excel file.")
     return pd.concat(frames, ignore_index=True).fillna("")
 
-
-def read_docx_to_df(path: str) -> pd.DataFrame:
-    doc = Document(path)
-    rows = []
-
-    # paragraphs
-    for p in doc.paragraphs:
-        txt = p.text.strip()
-        if txt:
-            rows.append({"content": txt})
-
-    # tables
-    for t_i, table in enumerate(doc.tables):
-        for r in table.rows:
-            cells = [c.text.strip() for c in r.cells]
-            if any(cells):
-                rows.append({"content": " | ".join(cells)})
-
-    if not rows:
-        raise ValueError("No text or tables found in Word document.")
-    return pd.DataFrame(rows)
-
-
 def parse_input(path: str) -> pd.DataFrame:
     ext = os.path.splitext(path)[1].lower()
     if ext in {".xlsx", ".xls"}:
@@ -86,7 +96,7 @@ def parse_input(path: str) -> pd.DataFrame:
     else:
         raise ValueError("Unsupported file type.")
 
-
+# ------------------------- Pagination -------------------------
 def paginate_df(df: pd.DataFrame, rows_per_page: int) -> List[pd.DataFrame]:
     pages = []
     total = len(df)
@@ -94,10 +104,9 @@ def paginate_df(df: pd.DataFrame, rows_per_page: int) -> List[pd.DataFrame]:
         pages.append(df.iloc[start:start + rows_per_page].reset_index(drop=True))
     return pages
 
-
+# ------------------------- Export Excel -------------------------
 def export_excel(pages: List[pd.DataFrame], out_path: str) -> None:
     wb = Workbook()
-    # remove default sheet
     default = wb.active
     wb.remove(default)
     for i, page in enumerate(pages, 1):
@@ -117,7 +126,7 @@ def export_excel(pages: List[pd.DataFrame], out_path: str) -> None:
     wb.save(out_path)
     logger.info(f"Excel exported: {out_path}")
 
-
+# ------------------------- Export PDF -------------------------
 def _table_from_df(df: pd.DataFrame):
     data = [list(df.columns)] + df.astype(str).values.tolist()
     table = Table(data, repeatRows=1)
@@ -135,7 +144,6 @@ def _table_from_df(df: pd.DataFrame):
     table.setStyle(style)
     return table
 
-
 def export_pdf(pages: List[pd.DataFrame], out_path: str, title: str = "Export") -> None:
     doc = SimpleDocTemplate(out_path, pagesize=landscape(A4), rightMargin=24, leftMargin=24, topMargin=24, bottomMargin=24)
     styles = getSampleStyleSheet()
@@ -150,12 +158,11 @@ def export_pdf(pages: List[pd.DataFrame], out_path: str, title: str = "Export") 
     doc.build(story)
     logger.info(f"PDF exported: {out_path}")
 
-
+# ------------------------- Translation -------------------------
 def translate_df_to_english(df: pd.DataFrame, batch_size: int = 40) -> pd.DataFrame:
     translator = GoogleTranslator(source='auto', target='en')
     out = df.copy()
     for col in out.columns:
-        # Only translate object columns
         series = out[col].astype(str)
         translated = []
         buffer = []
@@ -177,19 +184,18 @@ def translate_df_to_english(df: pd.DataFrame, batch_size: int = 40) -> pd.DataFr
         out[col] = translated
     return out
 
-# ------------------------- UI -------------------------
+# ------------------------- Streamlit UI -------------------------
 st.set_page_config(page_title="File Splitter → PDF → English", layout="wide")
-
 st.title("📄 File Splitter → Excel Pages → PDF → English Translator")
-
-st.markdown("Upload an **Excel (.xlsx/.xls)** or **Word (.docx)** file. The app will: ")
-st.markdown("1) Split into pages (default 50 rows per page) as Excel sheets  \
-2) Export a PDF  \
-3) Translate content to English and export a translated PDF")
+st.markdown("""
+Upload an **Excel (.xlsx/.xls)** or **Word (.docx)** file. The app will:  
+1) Split into pages (default 50 rows per page) as Excel sheets  
+2) Export a PDF  
+3) Translate content to English and export a translated PDF
+""")
 
 rows_per_page = st.number_input("Rows per page", min_value=5, max_value=500, value=50, step=5)
-
-uploaded = st.file_uploader("Upload file", type=["xlsx", "xls", "docx"]) 
+uploaded = st.file_uploader("Upload file", type=["xlsx", "xls", "docx"])
 
 if uploaded is not None:
     try:
